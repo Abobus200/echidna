@@ -1,0 +1,113 @@
+name: Ultimate Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1. Генерация версии (Тега)
+      - name: Compute next tag
+        id: tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date();
+            const yy = String(now.getFullYear()).slice(-2);
+            const tags = await github.paginate(
+              github.rest.repos.listTags,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            const regex = new RegExp(`^${yy}\\.([0-9]+)$`);
+            let max = 0;
+            for (const tag of tags) {
+              const match = tag.name.match(regex);
+              if (match) {
+                const n = parseInt(match[1], 10);
+                if (!Number.isNaN(n)) { max = Math.max(max, n); }
+              }
+            }
+            const nextTag = `${yy}.${max + 1}`;
+            const exists = tags.some((t) => t.name === nextTag);
+            if (!exists) {
+              await github.rest.git.createRef({
+                owner: context.repo.owner, repo: context.repo.repo,
+                ref: `refs/tags/${nextTag}`, sha: context.sha,
+              });
+            }
+            core.setOutput("tag", nextTag);
+
+      # 2. Сборка C++ (Движок DSP и Zygisk модуль)
+      - name: Build Native Libraries
+        env:
+          ECHIDNA_VERSION: ${{ steps.tag.outputs.tag }}
+        run: |
+          cmake -S native/dsp -B build/dsp -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26
+          cmake --build build/dsp --config Release
+          
+          cmake -S native/zygisk -B build/zygisk -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26
+          cmake --build build/zygisk --config Release
+
+      # 3. Упаковка в Magisk
+      - name: Build Magisk Module
+        env:
+          ECHIDNA_VERSION: ${{ steps.tag.outputs.tag }}
+        run: |
+          bash tools/build_magisk_module.sh
+
+      # 4. Настройка Java для Android
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 5. Сборка APK (Используем экшен разработчика, чтобы не было ошибки плагинов)
+      - name: Build Companion App (APK)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.5
+          arguments: assembleDebug
+          build-root-directory: android/app
+
+      # 6. Сборка LSPosed Shim (Прослойка для стабильной работы)
+      - name: Build LSPosed Shim (APK)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 8.5
+          arguments: assembleDebug
+          build-root-directory: android/lsposed-shim
+
+      # 7. Собираем всё добро в одну папку
+      - name: Collect Artifacts
+        run: |
+          mkdir -p final_assets
+          # Забираем Magisk-модуль
+          cp out/echidna-magisk.zip final_assets/echidna-magisk.zip
+          
+          # Забираем основное приложение
+          find android/app/build/outputs/apk -name "*.apk" -exec cp {} final_assets/Echidna-Companion.apk \;
+          
+          # Забираем LSPosed Shim
+          find android/lsposed-shim/build/outputs/apk -name "*.apk" -exec cp {} final_assets/Echidna-LSPosed-Shim.apk \; || true
+
+      # 8. Публикация релиза на GitHub
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Echidna Release ${{ steps.tag.outputs.tag }}
+          files: final_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
