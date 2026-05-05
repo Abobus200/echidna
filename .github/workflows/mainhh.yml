@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next tag
+        id: tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date();
+            const yy = String(now.getFullYear()).slice(-2);
+            const tags = await github.paginate(
+              github.rest.repos.listTags,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            const regex = new RegExp(`^${yy}\\.([0-9]+)$`);
+            let max = 0;
+            for (const tag of tags) {
+              const match = tag.name.match(regex);
+              if (match) {
+                const n = parseInt(match[1], 10);
+                if (!Number.isNaN(n)) {
+                  max = Math.max(max, n);
+                }
+              }
+            }
+            const next = max + 1;
+            const nextTag = `${yy}.${next}`;
+            core.setOutput("tag", nextTag);
+
+  build:
+    runs-on: ubuntu-latest
+    needs: tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 1. Собираем нативные библиотеки (C++)
+      - name: Build Native Libraries
+        run: |
+          cmake -S native/dsp -B build/dsp -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26
+          cmake --build build/dsp --config Release
+          
+          cmake -S native/zygisk -B build/zygisk -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26
+          cmake --build build/zygisk --config Release
+
+      # 2. Собираем Magisk модуль
+      - name: Build Magisk Module
+        run: |
+          mkdir -p out
+          # Копируем библиотеки туда, где их ждет скрипт сборки модуля
+          # ВНИМАНИЕ: Проверь пути в своем проекте, обычно они лежат в build/dsp/lib/arm64-v8a/
+          bash tools/build_magisk_module.sh
+
+      # 3. Собираем APK (Приложение)
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :android:app:assembleDebug
+
+      # 4. Собираем все артефакты в одну папку
+      - name: Collect Artifacts
+        run: |
+          mkdir -p final_assets
+          cp out/echidna-magisk.zip final_assets/
+          cp android/app/build/outputs/apk/debug/app-debug.apk final_assets/Echidna-Companion.apk
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag.outputs.tag }}
+          name: Echidna ${{ needs.tag.outputs.tag }}
+          files: final_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
